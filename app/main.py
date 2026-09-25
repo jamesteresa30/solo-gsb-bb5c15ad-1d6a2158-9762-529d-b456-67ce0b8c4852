@@ -89,8 +89,10 @@ logger.setLevel(logging.INFO)
 def now_utc() -> datetime:
     """服务端当前 UTC 时间。
 
-    委托给统一时钟模块 ``app.clock``：阶段判定与记录 created_at 默认值
-    共用同一时间来源，测试中替换 ``app.clock.now_utc`` 即可同时控制两者。
+    委托给统一时钟模块 ``app.clock``。每个写请求只在入口读取一次：该时刻
+    同时用于阶段准入判定与本次记录 ``created_at`` 的显式赋值，模型默认值
+    不再二次读数，避免两次读数跨过截止点导致「准入阶段与记录时间分属两个
+    阶段」。测试中替换 ``app.clock.now_utc`` 即可控制全部时间来源。
     """
     return clock.now_utc()
 
@@ -393,6 +395,8 @@ def compute_hash(payload: RevealCreate):
 def create_event(payload: EventCreate, db: Session = Depends(get_db)):
     commit_dl = as_utc(payload.commit_deadline)
     reveal_dl = as_utc(payload.reveal_deadline)
+    # 单次读数：该时刻同时用于截止判定与事件 created_at，模型默认值不再
+    # 二次读数，避免判定后时钟跨过 commit_deadline 却仍创建事件
     now = now_utc()
     if reveal_dl <= commit_dl:
         raise api_error(400, "INVALID_DEADLINES", "reveal_deadline 必须晚于 commit_deadline")
@@ -403,6 +407,7 @@ def create_event(payload: EventCreate, db: Session = Depends(get_db)):
         description=payload.description,
         commit_deadline=commit_dl,
         reveal_deadline=reveal_dl,
+        created_at=now,
     )
     db.add(event)
     db.commit()
@@ -579,6 +584,7 @@ def extend_event_deadlines(
         new_commit_deadline=new_commit_dl,
         new_reveal_deadline=new_reveal_dl,
         reason=payload.reason,
+        created_at=now,
     )
     event.commit_deadline = new_commit_dl
     event.reveal_deadline = new_reveal_dl
@@ -827,6 +833,8 @@ def audit_commitment_reuse(payload: CommitmentReuseAuditRequest, db: Session = D
 @app.post("/events/{event_id}/commitments", status_code=201, response_model=CommitmentOut)
 def submit_commitment(event_id: UUID, payload: CommitmentCreate, db: Session = Depends(get_db)):
     event = get_event_or_404(db, event_id)
+    # 单次读数：准入判定与本条承诺 created_at 共用同一时刻，模型默认值
+    # 不再二次读数，避免获准提交的记录被记到 reveal 阶段
     now = now_utc()
     commit_dl = as_utc(event.commit_deadline)
     if now >= commit_dl:
@@ -835,7 +843,11 @@ def submit_commitment(event_id: UUID, payload: CommitmentCreate, db: Session = D
             "COMMIT_PHASE_CLOSED",
             f"提交截止时间为 {commit_dl.isoformat()}，当前服务端时间 {now.isoformat()}，迟到提交被拒绝",
         )
-    commitment = Commitment(event_id=event.id, commitment_hash=payload.commitment_hash.lower())
+    commitment = Commitment(
+        event_id=event.id,
+        commitment_hash=payload.commitment_hash.lower(),
+        created_at=now,
+    )
     db.add(commitment)
     try:
         db.commit()
@@ -864,6 +876,9 @@ def submit_commitments_batch(
     全部通过时按输入顺序创建，并以相同顺序返回记录。
     """
     event = get_event_or_404(db, event_id)
+    # 单次读数：准入判定与整批承诺的 created_at 共用同一时刻——批内各条
+    # 记录时间戳相同，模型默认值不再逐项二次读数，避免获准提交的记录被
+    # 记到 reveal 阶段；冲突依旧整体回滚
     now = now_utc()
     commit_dl = as_utc(event.commit_deadline)
     if now >= commit_dl:
@@ -928,9 +943,10 @@ def submit_commitments_batch(
             conflicts=conflicts,
         )
 
-    # 4) 全部通过：按输入顺序在同一事务中创建
+    # 4) 全部通过：按输入顺序在同一事务中创建，created_at 共用准入时刻 now
     commitments = [
-        Commitment(event_id=event.id, commitment_hash=norm) for norm in normalized
+        Commitment(event_id=event.id, commitment_hash=norm, created_at=now)
+        for norm in normalized
     ]
     db.add_all(commitments)
     try:
@@ -986,6 +1002,8 @@ def list_commitments(event_id: UUID, db: Session = Depends(get_db)):
 @app.post("/events/{event_id}/reveals", status_code=201, response_model=RevealOut)
 def submit_reveal(event_id: UUID, payload: RevealCreate, db: Session = Depends(get_db)):
     event = get_event_or_404(db, event_id)
+    # 单次读数：准入判定与本条揭示 created_at 共用同一时刻，模型默认值
+    # 不再二次读数，避免获准揭示的记录被记到 closed 阶段
     now = now_utc()
     commit_dl = as_utc(event.commit_deadline)
     reveal_dl = as_utc(event.reveal_deadline)
@@ -1027,6 +1045,7 @@ def submit_reveal(event_id: UUID, payload: RevealCreate, db: Session = Depends(g
         original_text=payload.original_text,
         salt=payload.salt,
         recomputed_hash=recomputed,
+        created_at=now,
     )
     db.add(reveal)
     try:
@@ -1074,6 +1093,9 @@ def submit_reveals_batch(
     竞争落败的事务整体回滚，不留下部分揭示。
     """
     event = get_event_or_404(db, event_id)
+    # 单次读数：准入判定与整批揭示的 created_at 共用同一时刻——批内各条
+    # 记录时间戳相同，模型默认值不再逐项二次读数，避免获准揭示的记录被
+    # 记到 closed 阶段；冲突依旧整体回滚
     now = now_utc()
     commit_dl = as_utc(event.commit_deadline)
     reveal_dl = as_utc(event.reveal_deadline)
@@ -1190,7 +1212,7 @@ def submit_reveals_batch(
             conflicts=conflicts,
         )
 
-    # 4) 全部通过：按输入顺序在同一事务中创建
+    # 4) 全部通过：按输入顺序在同一事务中创建，created_at 共用准入时刻 now
     reveals = [
         Reveal(
             event_id=event.id,
@@ -1198,6 +1220,7 @@ def submit_reveals_batch(
             original_text=items[i].original_text,
             salt=items[i].salt,
             recomputed_hash=digest,
+            created_at=now,
         )
         for i, digest in enumerate(recomputed)
     ]
@@ -1342,6 +1365,7 @@ def settle_event(event_id: UUID, payload: SettlementCreate, db: Session = Depend
         correct_count=correct,
         incorrect_count=incorrect,
         unrevealed_count=unrevealed,
+        created_at=now,
     )
     db.add(settlement)
     try:

@@ -59,6 +59,15 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 
 边界语义：到达 commit_deadline 的瞬间提交通道关闭、揭示通道开启；到达 reveal_deadline 揭示通道关闭，事件进入 closed 阶段，此后可提交一次永久结算。
 
+**同一请求、同一 UTC 时刻**：每个会写入的请求（创建事件、单条/批量提交承诺、
+单条/批量揭示）在入口只读取**一次**服务端 UTC 时钟，该时刻同时用于阶段准入
+判定与本次记录 `created_at` 的写入——准入判定与记录时间不可能分属两个阶段，
+即使读取与落库之间真实时钟恰好跨过某个截止点，获准的记录也不会被记到下一
+阶段。批量请求内**各项记录共用这同一时刻**（时间戳全部相等），各项冲突仍按
+原语义**整体回滚**；准入未通过的请求一律拒绝且不落库。因此历史快照按
+`created_at <= at` 回放、时间线按 `created_at` 排序时，记录所处阶段与它被
+接受的阶段始终一致。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -498,7 +507,9 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 
 列表为空或超过 100 项返回 422；事件不存在返回 `404 EVENT_NOT_FOUND`；
 已过 `commit_deadline` 与单个提交端点一致返回 `409 COMMIT_PHASE_CLOSED`，
-以上情形同样不产生任何写入。
+以上情形同样不产生任何写入。整批的阶段判定与各条承诺 `created_at` 取自
+**请求入口的同一 UTC 时刻**（详见上文「事件生命周期」），因此返回记录的
+提交时间全部相等，且不会出现「截止前获准、记录却落在揭示期」的情况。
 
 ## 原子批量揭示（`POST /events/{id}/reveals/batch`）
 
@@ -569,7 +580,9 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 以上情形均不产生任何写入。批量端点与单个揭示端点共享同一套存储与唯一约束：
 **并发下仅首次揭示生效**——预检阶段对命中的承诺加行锁（PostgreSQL），
 提交阶段再由 `reveals.commitment_id` 唯一约束兜底，竞争落败的整批请求回滚并
-收到逐项 `DUPLICATE_REVEAL` 清单。
+收到逐项 `DUPLICATE_REVEAL` 清单。整批的阶段判定与各条揭示 `created_at`
+取自**请求入口的同一 UTC 时刻**（详见上文「事件生命周期」），返回记录的
+揭示时间全部相等，且不会出现「揭示期内获准、记录却落在 closed 阶段」的情况。
 
 ## 事件承诺集合证明（Merkle）
 
@@ -1097,6 +1110,7 @@ app/
   calibration.py # 跨事件概率校准报告：[0,1] 概率严格解析、Decimal Brier 均分与十分箱汇总（纯函数）
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
+tests/test_request_timestamp.py # 准入判定与 created_at 共用同一请求时刻：跨截止点不串阶段、批量共用时刻、拒绝不落库
 tests/test_schema_bootstrap.py # 启动期结构核对：空库初始化、半旧库拒绝就绪（503 列缺失表/列）、完整旧库保留数据
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
