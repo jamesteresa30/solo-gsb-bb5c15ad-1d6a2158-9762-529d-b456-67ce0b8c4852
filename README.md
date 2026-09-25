@@ -59,6 +59,15 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 
 边界语义：到达 commit_deadline 的瞬间提交通道关闭、揭示通道开启；到达 reveal_deadline 揭示通道关闭，事件进入 closed 阶段，此后可提交一次永久结算。
 
+**写入时刻与准入判定同一时刻**：创建事件、单条/批量提交承诺、单条/批量揭示的
+每个请求只在准入判定时读取**一次**服务端 UTC 时钟，本次写入记录的 `created_at`
+与该判定时刻相同（批量各项的 `created_at` 完全一致），不做二次读钟。因此不存在
+「判定在截止前通过、记录时间戳却落到截止后」的脱节：获准写入的记录其
+`created_at` 必然位于获准时的阶段内（事件创建时刻早于 commit_deadline、承诺在
+commit 阶段内、揭示在 reveal 阶段内），按 `created_at` 回放的历史快照
+（`GET /events/{id}/snapshot`）与事件时间线（`GET /events/{id}/timeline`）
+始终自相一致；未通过判定的请求不落库。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -446,7 +455,8 @@ curl -s -X POST http://localhost:8000/events/commitments/reuse-audit \
 ## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
 
 在**单个数据库事务**中按输入顺序提交 1～100 个承诺哈希。服务端在写入前完成全部校验，
-**任何一项冲突都整体回滚**，不会留下部分承诺：
+**任何一项冲突都整体回滚**，不会留下部分承诺。整批各项的 `created_at` 与准入判定
+共用同一时刻（完全一致，见「事件生命周期」的写入时刻说明）：
 
 - 逐项校验哈希格式（64 位十六进制，大小写均可，存储时归一化为小写）；
 - 检查请求内重复（第二次及以后出现的下标记为请求内重复，大小写不敏感）；
@@ -504,7 +514,8 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 
 进入揭示期后，可在**单个数据库事务**中按输入顺序提交 1～100 组「原文 + 盐」。
 服务端按约定方案逐项重算哈希并与该事件的承诺匹配，**所有项目先完成全部校验，
-任何一项冲突都整体回滚**，不会留下部分揭示：
+任何一项冲突都整体回滚**，不会留下部分揭示。整批各项的 `created_at` 与准入判定
+共用同一时刻（完全一致，见「事件生命周期」的写入时刻说明）：
 
 - 逐项校验格式（盐须为 1～256 字符的字符串）；
 - 按重算哈希检查请求内重复（第二次及以后出现的下标记为请求内重复）；
@@ -1106,6 +1117,7 @@ tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制
 tests/test_extend_same_timestamp.py # 同刻连续延长：按延长链新截止时间排序的快照、幂等重放与时间线回归
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
+tests/test_write_timestamp.py # 写入时刻回归：准入判定与 created_at 共用同一时刻（步进时钟跨截止点）
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
 tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定、命中排名、无效/未揭示分类与只读
 tests/test_calibration_report.py # 跨事件概率校准：严格概率解析、Brier 均分、十分箱边界与五成双量化

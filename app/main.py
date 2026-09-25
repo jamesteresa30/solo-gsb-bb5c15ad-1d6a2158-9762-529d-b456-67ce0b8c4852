@@ -4,6 +4,11 @@
   [创建, commit_deadline)   commit 阶段：可提交承诺
   [commit_deadline, reveal_deadline)  reveal 阶段：可揭示
   [reveal_deadline, ∞)      closed：只读
+
+写入约定：创建事件与单条/批量提交承诺、揭示的请求，只在准入判定时读取
+一次服务端 UTC 时钟，本次记录的 created_at 与该判定时刻相同（批量各项
+完全一致），不做二次读钟——获准写入的记录其 created_at 必然位于获准时
+的阶段内，快照与时间线据此回放时自相一致。
 """
 
 import logging
@@ -398,11 +403,14 @@ def create_event(payload: EventCreate, db: Session = Depends(get_db)):
         raise api_error(400, "INVALID_DEADLINES", "reveal_deadline 必须晚于 commit_deadline")
     if commit_dl <= now:
         raise api_error(400, "INVALID_DEADLINES", "commit_deadline 必须晚于当前服务端 UTC 时间")
+    # 准入判定与记录写入共用同一时刻 now：created_at 不再由模型默认值二次读钟，
+    # 保证事件的创建时间必然落在判定通过时的 commit 阶段内
     event = Event(
         title=payload.title,
         description=payload.description,
         commit_deadline=commit_dl,
         reveal_deadline=reveal_dl,
+        created_at=now,
     )
     db.add(event)
     db.commit()
@@ -835,7 +843,13 @@ def submit_commitment(event_id: UUID, payload: CommitmentCreate, db: Session = D
             "COMMIT_PHASE_CLOSED",
             f"提交截止时间为 {commit_dl.isoformat()}，当前服务端时间 {now.isoformat()}，迟到提交被拒绝",
         )
-    commitment = Commitment(event_id=event.id, commitment_hash=payload.commitment_hash.lower())
+    commitment = Commitment(
+        event_id=event.id,
+        commitment_hash=payload.commitment_hash.lower(),
+        # 与准入判定共用同一时刻 now：获准提交的记录其 created_at 必然在
+        # commit 阶段内，不会落入 reveal 阶段令快照与时间线自相矛盾
+        created_at=now,
+    )
     db.add(commitment)
     try:
         db.commit()
@@ -861,7 +875,8 @@ def submit_commitments_batch(
       - DUPLICATE_IN_REQUEST：在本次请求内部重复（第二次及以后出现的下标）
       - DUPLICATE_COMMITMENT：数据库中该事件已有此哈希
     格式非法优先于重复判定；冲突清单按下标升序，每个下标至多一项。
-    全部通过时按输入顺序创建，并以相同顺序返回记录。
+    全部通过时按输入顺序创建，并以相同顺序返回记录；整批各项的
+    created_at 与准入判定共用同一时刻（完全一致）。
     """
     event = get_event_or_404(db, event_id)
     now = now_utc()
@@ -928,9 +943,11 @@ def submit_commitments_batch(
             conflicts=conflicts,
         )
 
-    # 4) 全部通过：按输入顺序在同一事务中创建
+    # 4) 全部通过：按输入顺序在同一事务中创建；整批各项与准入判定共用
+    #    同一时刻 now 作为 created_at（批量各项时间戳完全一致）
     commitments = [
-        Commitment(event_id=event.id, commitment_hash=norm) for norm in normalized
+        Commitment(event_id=event.id, commitment_hash=norm, created_at=now)
+        for norm in normalized
     ]
     db.add_all(commitments)
     try:
@@ -1027,6 +1044,9 @@ def submit_reveal(event_id: UUID, payload: RevealCreate, db: Session = Depends(g
         original_text=payload.original_text,
         salt=payload.salt,
         recomputed_hash=recomputed,
+        # 与准入判定共用同一时刻 now：获准揭示的记录其 created_at 必然在
+        # reveal 阶段内，不会落入 closed 阶段令快照与时间线自相矛盾
+        created_at=now,
     )
     db.add(reveal)
     try:
@@ -1067,7 +1087,8 @@ def submit_reveals_batch(
       - DUPLICATE_REVEAL：匹配到的承诺此前（本请求内首次出现的下标）
         已被揭示
     格式非法优先于后续判定；冲突清单按下标升序，每个下标至多一项。
-    全部通过时按输入顺序在同一事务中创建，并以相同顺序返回记录。
+    全部通过时按输入顺序在同一事务中创建，并以相同顺序返回记录；
+    整批各项的 created_at 与准入判定共用同一时刻（完全一致）。
 
     并发下「仅首次揭示生效」由两重机制保证：预检阶段对命中的承诺加行锁
     （PostgreSQL），写入阶段由 reveals.commitment_id 唯一约束兜底——
@@ -1190,7 +1211,8 @@ def submit_reveals_batch(
             conflicts=conflicts,
         )
 
-    # 4) 全部通过：按输入顺序在同一事务中创建
+    # 4) 全部通过：按输入顺序在同一事务中创建；整批各项与准入判定共用
+    #    同一时刻 now 作为 created_at（批量各项时间戳完全一致）
     reveals = [
         Reveal(
             event_id=event.id,
@@ -1198,6 +1220,7 @@ def submit_reveals_batch(
             original_text=items[i].original_text,
             salt=items[i].salt,
             recomputed_hash=digest,
+            created_at=now,
         )
         for i, digest in enumerate(recomputed)
     ]
